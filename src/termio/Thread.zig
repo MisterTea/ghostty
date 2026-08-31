@@ -344,6 +344,7 @@ fn drainMailbox(
                 defer v.alloc.free(v.pw);
                 try io.kittyClipboardGrant(v.pw, .write);
             },
+            .htm_init_complete => io.htmInitComplete(),
             .start_synchronized_output => self.startSynchronizedOutput(cb),
             .linefeed_mode => |v| self.flags.linefeed_mode = v,
             .focused => |v| try io.focusGained(data, v),

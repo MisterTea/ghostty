@@ -11,28 +11,34 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
 
 /// The kinds of backends.
-pub const Kind = enum { exec };
+pub const Kind = enum { exec, htm };
 
 /// Configuration for the various backend types.
 pub const Config = union(Kind) {
     /// Exec uses posix exec to run a command with a pty.
     exec: termio.Exec.Config,
+
+    /// HTM follower: no local pty; I/O is multiplexed via the leader.
+    htm: termio.Htm.Config,
 };
 
 /// Backend implementations. A backend is responsible for owning the pty
 /// behavior and providing read/write capabilities.
 pub const Backend = union(Kind) {
     exec: termio.Exec,
+    htm: termio.Htm,
 
     pub fn deinit(self: *Backend) void {
         switch (self.*) {
             .exec => |*exec| exec.deinit(),
+            .htm => |*htm| htm.deinit(),
         }
     }
 
     pub fn initTerminal(self: *Backend, t: *terminal.Terminal) void {
         switch (self.*) {
             .exec => |*exec| exec.initTerminal(t),
+            .htm => |*htm| htm.initTerminal(t),
         }
     }
 
@@ -44,12 +50,14 @@ pub const Backend = union(Kind) {
     ) !void {
         switch (self.*) {
             .exec => |*exec| try exec.threadEnter(alloc, io, td),
+            .htm => |*htm| try htm.threadEnter(alloc, io, td),
         }
     }
 
     pub fn threadExit(self: *Backend, td: *termio.Termio.ThreadData) void {
         switch (self.*) {
             .exec => |*exec| exec.threadExit(td),
+            .htm => |*htm| htm.threadExit(td),
         }
     }
 
@@ -60,6 +68,7 @@ pub const Backend = union(Kind) {
     ) !void {
         switch (self.*) {
             .exec => |*exec| try exec.focusGained(td, focused),
+            .htm => |*htm| try htm.focusGained(td, focused),
         }
     }
 
@@ -70,6 +79,7 @@ pub const Backend = union(Kind) {
     ) !void {
         switch (self.*) {
             .exec => |*exec| try exec.resize(grid_size, screen_size),
+            .htm => |*htm| try htm.resize(grid_size, screen_size),
         }
     }
 
@@ -82,6 +92,7 @@ pub const Backend = union(Kind) {
     ) !void {
         switch (self.*) {
             .exec => |*exec| try exec.queueWrite(alloc, td, data, linefeed),
+            .htm => |*htm| try htm.queueWrite(alloc, td, data, linefeed),
         }
     }
 
@@ -99,6 +110,12 @@ pub const Backend = union(Kind) {
                 exit_code,
                 runtime_ms,
             ),
+            .htm => |*htm| try htm.childExitedAbnormally(
+                gpa,
+                t,
+                exit_code,
+                runtime_ms,
+            ),
         }
     }
 
@@ -108,6 +125,7 @@ pub const Backend = union(Kind) {
     pub fn getProcessInfo(self: *Backend, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
         return switch (self.*) {
             .exec => |*exec| exec.getProcessInfo(info),
+            .htm => |*htm| htm.getProcessInfo(info),
         };
     }
 };
@@ -115,10 +133,12 @@ pub const Backend = union(Kind) {
 /// Termio thread data. See termio.ThreadData for docs.
 pub const ThreadData = union(Kind) {
     exec: termio.Exec.ThreadData,
+    htm: termio.Htm.ThreadData,
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
         switch (self.*) {
             .exec => |*exec| exec.deinit(alloc),
+            .htm => |*htm| htm.deinit(alloc),
         }
     }
 

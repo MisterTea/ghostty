@@ -155,6 +155,13 @@ pub const Options = struct {
         /// C API: `ghostty_kitty_graphics_*`.
         kitty_graphics: bool = true,
 
+        /// HTM (Headless Terminal Multiplexer) protocol support: detect
+        /// `ESC[###q`, parse framed packets, and map Ghostty tabs/splits
+        /// onto `htmd` panes. The Ghostty application always builds this
+        /// on; embedders can disable it. Runtime `htm-integration = false`
+        /// also turns detection off without a rebuild.
+        htm_control_mode: bool = true,
+
         pub fn parse(list: []const u8) error{UnknownFeature}!Features {
             // Modifications apply on top of the default set.
             var result: Features = .{};

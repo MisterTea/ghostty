@@ -73,6 +73,19 @@ last_cursor_reset: ?std.Io.Timestamp = null,
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,
 
+/// HTM leader intercept state. Only used when this surface is the
+/// `htm` client PTY.
+htm: HtmIo = .{},
+
+const HtmIo = struct {
+    active: bool = false,
+    hold_packets: bool = false,
+    init_pending: [5]u8 = undefined,
+    init_pending_len: u8 = 0,
+    packet_buf: std.ArrayList(u8) = .empty,
+    viewer: terminalpkg.htm.Viewer = .{ .alloc = undefined },
+};
+
 /// The state we need to keep around only until we enter the IO
 /// thread. Then we can throw it all away.
 const ThreadEnterState = struct {
@@ -180,6 +193,7 @@ pub const DerivedConfig = struct {
     clipboard_write_limit: usize,
     enquiry_response: []const u8,
     conditional_state: configpkg.ConditionalState,
+    htm_integration: bool,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -217,6 +231,7 @@ pub const DerivedConfig = struct {
             .clipboard_write_limit = config.@"clipboard-write-limit-bytes".value,
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
             .conditional_state = config._conditional_state,
+            .htm_integration = config.@"htm-integration",
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -324,6 +339,9 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
             .handler = handler,
         }),
         .thread_enter_state = thread_enter_state,
+        .htm = .{
+            .viewer = .init(alloc),
+        },
     };
 }
 
@@ -338,6 +356,9 @@ pub fn deinit(self: *Termio) void {
 
     // Clear any initial state if we have it
     if (self.thread_enter_state) |v| v.destroy();
+
+    self.htm.packet_buf.deinit(self.alloc);
+    self.htm.viewer.deinit();
 }
 
 pub fn threadEnter(
@@ -435,6 +456,17 @@ pub inline fn queueWrite(
     data: []const u8,
     linefeed: bool,
 ) !void {
+    if (comptime terminalpkg.options.htm_control_mode) {
+        if (self.htm.active) {
+            const packet = terminalpkg.htm.encodeInsertDebugKeys(self.alloc, data) catch |err| {
+                log.warn("failed to wrap HTM debug keys err={}", .{err});
+                return err;
+            };
+            defer self.alloc.free(packet);
+            try self.backend.queueWrite(self.alloc, td, packet, false);
+            return;
+        }
+    }
     try self.backend.queueWrite(self.alloc, td, data, linefeed);
 }
 
@@ -670,6 +702,21 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
 
 /// Process output from readdata but the lock is already held.
 fn processOutputLocked(self: *Termio, buf: []const u8) void {
+    if (comptime terminalpkg.options.htm_control_mode) {
+        // Only the leader exec PTY is scanned. Follower backends inject
+        // already-decoded pane bytes and must not re-enter HTM mode.
+        if (self.config.htm_integration and self.backend == .exec) {
+            if (self.htm.active) {
+                self.consumeHtmLocked(buf);
+                return;
+            }
+            if (self.scanHtmInitLocked(buf)) return;
+        }
+    }
+    self.processOutputVtLocked(buf);
+}
+
+fn processOutputVtLocked(self: *Termio, buf: []const u8) void {
     // Schedule a render. We can call this first because we have the lock.
     self.terminal_stream.handler.queueRender() catch unreachable;
 
@@ -717,6 +764,180 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         self.terminal_stream.handler.termio_messaged = false;
         self.mailbox.notify();
     }
+}
+
+fn scanHtmInitLocked(self: *Termio, buf: []const u8) bool {
+    const htm = terminalpkg.htm;
+
+    // Fast path: no held prefix. Avoid copying every PTY chunk.
+    if (self.htm.init_pending_len == 0) {
+        if (std.mem.indexOf(u8, buf, htm.init_seq)) |init_at| {
+            if (init_at > 0) self.processOutputVtLocked(buf[0..init_at]);
+            self.htm.active = true;
+            self.pushSurfaceMessage(.{ .htm_enter = {} });
+            const rest = buf[init_at + htm.init_seq.len ..];
+            if (rest.len > 0) self.consumeHtmLocked(rest);
+            return true;
+        }
+        const hold = htm.longestInitPrefix(buf);
+        if (hold > 0) {
+            if (hold < buf.len) self.processOutputVtLocked(buf[0 .. buf.len - hold]);
+            @memcpy(self.htm.init_pending[0..hold], buf[buf.len - hold ..]);
+            self.htm.init_pending_len = @intCast(hold);
+            return true;
+        }
+        return false;
+    }
+
+    var stack = std.heap.stackFallback(512, self.alloc);
+    const scratch = stack.get();
+    var combined: std.ArrayList(u8) = .empty;
+    defer combined.deinit(scratch);
+
+    combined.appendSlice(scratch, self.htm.init_pending[0..self.htm.init_pending_len]) catch return false;
+    combined.appendSlice(scratch, buf) catch return false;
+
+    const result = htm.consumeInitPayload(combined.items);
+    if (result.prefix.len > 0) {
+        self.processOutputVtLocked(result.prefix);
+    }
+
+    if (result.matched) {
+        self.htm.init_pending_len = 0;
+        self.htm.active = true;
+        self.pushSurfaceMessage(.{ .htm_enter = {} });
+        if (result.remainder.len > 0) {
+            self.consumeHtmLocked(result.remainder);
+        }
+        return true;
+    }
+
+    if (result.pending.len > 0) {
+        std.debug.assert(result.pending.len <= self.htm.init_pending.len);
+        @memcpy(self.htm.init_pending[0..result.pending.len], result.pending);
+        self.htm.init_pending_len = @intCast(result.pending.len);
+    } else {
+        self.htm.init_pending_len = 0;
+    }
+    // Previously held bytes were fed as prefix; do not re-process `buf`.
+    return true;
+}
+
+fn consumeHtmLocked(self: *Termio, buf: []const u8) void {
+    const htm = terminalpkg.htm;
+    if (std.mem.indexOf(u8, buf, htm.exit_seq) != null) {
+        self.exitHtmLocked();
+        return;
+    }
+
+    self.htm.packet_buf.appendSlice(self.alloc, buf) catch |err| {
+        log.warn("HTM packet buffer append failed err={}", .{err});
+        return;
+    };
+
+    if (std.mem.indexOf(u8, self.htm.packet_buf.items, htm.exit_seq) != null) {
+        self.exitHtmLocked();
+        return;
+    }
+
+    self.drainHtmPacketsLocked();
+}
+
+fn drainHtmPacketsLocked(self: *Termio) void {
+    const htm = terminalpkg.htm;
+    while (!self.htm.hold_packets) {
+        const one = htm.parseOne(self.htm.packet_buf.items);
+        const packet = one.packet orelse break;
+        const consumed = one.consumed;
+
+        const action = self.htm.viewer.process(self.alloc, packet) catch |err| {
+            log.warn("HTM packet process failed err={}", .{err});
+            self.advanceHtmBuf(consumed);
+            continue;
+        };
+
+        self.advanceHtmBuf(consumed);
+
+        if (action) |a| self.dispatchHtmActionLocked(a);
+    }
+}
+
+fn advanceHtmBuf(self: *Termio, consumed: usize) void {
+    const rest = self.htm.packet_buf.items[consumed..];
+    if (rest.len == 0) {
+        self.htm.packet_buf.clearRetainingCapacity();
+        return;
+    }
+    std.mem.copyForwards(u8, self.htm.packet_buf.items, rest);
+    self.htm.packet_buf.shrinkRetainingCapacity(rest.len);
+}
+
+fn dispatchHtmActionLocked(self: *Termio, action: terminalpkg.htm.Action) void {
+    switch (action) {
+        .exit => self.exitHtmLocked(),
+        .invalid_length => {
+            log.warn("invalid HTM packet length, closing surface", .{});
+            self.pushSurfaceMessage(.{ .close = {} });
+        },
+        .debug_log => |data| {
+            defer self.alloc.free(data);
+            self.processOutputVtLocked(data);
+        },
+        .sync_layout => |json| {
+            self.htm.hold_packets = true;
+            const req = apprt.surface.Message.WriteReq.init(self.alloc, json) catch |err| {
+                self.alloc.free(json);
+                self.htm.hold_packets = false;
+                log.warn("HTM INIT_STATE queue failed err={}", .{err});
+                return;
+            };
+            self.alloc.free(json);
+            self.pushSurfaceMessage(.{ .htm_sync_layout = req });
+        },
+        .pane_output => |out| {
+            defer self.alloc.free(out.data);
+            const total = terminalpkg.htm.UUID_LENGTH + out.data.len;
+            const payload = self.alloc.alloc(u8, total) catch {
+                log.warn("HTM pane output alloc failed", .{});
+                return;
+            };
+            defer self.alloc.free(payload);
+            @memcpy(payload[0..terminalpkg.htm.UUID_LENGTH], &out.pane_id);
+            @memcpy(payload[terminalpkg.htm.UUID_LENGTH..], out.data);
+            const req = apprt.surface.Message.WriteReq.init(self.alloc, payload) catch |err| {
+                log.warn("HTM pane output queue failed err={}", .{err});
+                return;
+            };
+            self.pushSurfaceMessage(.{ .htm_output = req });
+        },
+        .close_pane => |pane_id| {
+            self.pushSurfaceMessage(.{ .htm_close_pane = pane_id });
+        },
+    }
+}
+
+fn exitHtmLocked(self: *Termio) void {
+    self.htm.active = false;
+    self.htm.hold_packets = false;
+    self.htm.init_pending_len = 0;
+    self.htm.packet_buf.clearRetainingCapacity();
+    self.pushSurfaceMessage(.{ .htm_exit = {} });
+}
+
+fn pushSurfaceMessage(self: *Termio, msg: apprt.surface.Message) void {
+    if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
+        self.renderer_state.mutex.unlock(global.io());
+        defer self.renderer_state.mutex.lockUncancelable(global.io());
+        _ = self.surface_mailbox.push(msg, .{ .forever = {} });
+    }
+}
+
+/// Resume HTM packet processing after INIT_STATE UI rebuild finishes.
+pub fn htmInitComplete(self: *Termio) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.htm.hold_packets = false;
+    self.drainHtmPacketsLocked();
 }
 
 /// Sends a DSR response for the current color scheme to the pty.

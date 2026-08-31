@@ -575,6 +575,7 @@ pub const Config = struct {
     working_directory: ?[]const u8 = null,
     resources_dir: ?[]const u8,
     term: []const u8,
+    htm_bin_dir: ?[]const u8 = null,
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -707,6 +708,23 @@ const Subprocess = struct {
                 );
             } else {
                 try env.put("PATH", exe_dir);
+            }
+        }
+
+        if (cfg.htm_bin_dir) |dir| {
+            if (dir.len > 0) {
+                if (env.get("PATH")) |path| {
+                    try env.put(
+                        "PATH",
+                        try std.fmt.allocPrint(alloc, "{s}{c}{s}", .{
+                            dir,
+                            std.fs.path.delimiter,
+                            path,
+                        }),
+                    );
+                } else {
+                    try env.put("PATH", dir);
+                }
             }
         }
 

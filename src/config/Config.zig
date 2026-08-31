@@ -1154,6 +1154,20 @@ palette: Palette = .{},
 /// information.
 command: ?Command = null,
 
+/// Directory containing Eternal Terminal's `htm` and `htmd` binaries.
+/// Prepended to `PATH` for new surfaces so `htm` can be launched from a
+/// shell without a global install.
+///
+/// Available since: 1.3.0
+@"htm-bin-dir": ?[:0]const u8 = null,
+
+/// When true, Ghostty watches for the HTM init sequence (`ESC[###q`) and
+/// maps native tabs and splits onto `htmd` panes (similar to the hyper-htm
+/// plugin). Disable this if you never use HTM.
+///
+/// Available since: 1.3.0
+@"htm-integration": bool = true,
+
 /// This is the same as "command", but only applies to the first terminal
 /// surface created when Ghostty starts. Subsequent terminal surfaces will use
 /// the `command` configuration.

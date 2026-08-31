@@ -88,6 +88,9 @@ pub const Message = union(enum) {
     kitty_clipboard_grant_read: KittyClipboardGrant,
     kitty_clipboard_grant_write: KittyClipboardGrant,
 
+    /// Resume HTM packet processing after INIT_STATE UI rebuild.
+    htm_init_complete: void,
+
     /// Write where the data fits in the union.
     write_small: WriteReq.Small,
 

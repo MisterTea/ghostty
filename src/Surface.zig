@@ -34,6 +34,7 @@ const configpkg = @import("config.zig");
 const Duration = configpkg.Config.Duration;
 const input = @import("input.zig");
 const App = @import("App.zig");
+const HtmSession = @import("HtmSession.zig");
 const internal_os = @import("os/main.zig");
 const inspectorpkg = @import("inspector/main.zig");
 const SurfaceMouse = @import("surface_mouse.zig");
@@ -180,6 +181,9 @@ search: ?Search = null,
 
 /// Used to rate limit BEL handling.
 last_bell_time: ?std.Io.Timestamp = null,
+
+/// HTM pane UUID when this surface is a follower (no local PTY).
+htm_pane_id: ?terminal.htm.Uuid = null,
 
 /// The effect of an input event. This can be used by callers to take
 /// the appropriate action after an input event. For example, key
@@ -635,41 +639,66 @@ pub fn init(
         break :command config.command;
     };
 
+    const htm_follower = if (comptime terminal.options.htm_control_mode)
+        if (app.htm) |*session| session.shouldCreateFollower() else false
+    else
+        false;
+    if (htm_follower) {
+        if (app.htm) |*session| {
+            const pane_id = session.takePaneId();
+            const waiting = session.waiting_for_init;
+            const pending = session.pending;
+            const pending_source = session.pending_source;
+            session.pending = .none;
+            session.pending_source = null;
+            self.htm_pane_id = pane_id;
+            session.registerPane(pane_id, self);
+            if (!waiting) {
+                self.htmNotifyCreated(session, pending, pending_source);
+            }
+        }
+    }
+
     // Start our IO implementation
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+        const backend: termio.Backend = if (htm_follower) .{
+            .htm = .init(app, self.htm_pane_id.?),
+        } else backend: {
+            var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                // If an error occurs, we don't want to block surface startup.
+                log.warn("error getting env map for surface err={}", .{err});
+                break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+            };
+            errdefer env.deinit();
+
+            // don't leak GHOSTTY_LOG to any subprocesses
+            _ = env.orderedRemove("GHOSTTY_LOG");
+
+            var buf: [18]u8 = undefined;
+            try env.put(
+                "GHOSTTY_SURFACE_ID",
+                std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
+            );
+
+            var io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global.resourcesDir().host(),
+                .term = config.term,
+                .htm_bin_dir = config.@"htm-bin-dir",
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            errdefer io_exec.deinit();
+            break :backend .{ .exec = io_exec };
         };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        _ = env.orderedRemove("GHOSTTY_LOG");
-
-        var buf: [18]u8 = undefined;
-        try env.put(
-            "GHOSTTY_SURFACE_ID",
-            std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
-        );
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global.resourcesDir().host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -679,7 +708,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -817,6 +846,10 @@ pub fn deinit(self: *Surface) void {
             log.err("error notifying io thread to stop, may stall err={}", .{err});
         self.io_thr.join();
     }
+
+    // HTM teardown after IO is stopped so the leader thread cannot
+    // dispatch packets into a session we are destroying.
+    self.htmOnDeinit();
 
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
@@ -1189,6 +1222,12 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{ .selected = v },
             );
         },
+
+        .htm_enter => self.htmEnter(),
+        .htm_sync_layout => |req| self.htmSyncLayout(req),
+        .htm_output => |req| self.htmHandleOutput(req),
+        .htm_close_pane => |pane_id| self.htmClosePane(pane_id),
+        .htm_exit => self.htmExit(),
     }
 }
 
@@ -1336,9 +1375,10 @@ fn childExitedAbnormally(
     const alloc = arena.allocator();
 
     // Build up our command for the error message
-    const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
-        .exec => |*exec| exec.subprocess.args,
-    });
+    const command: []const u8 = switch (self.io.backend) {
+        .exec => |*exec| try std.mem.join(alloc, " ", exec.subprocess.args),
+        .htm => "htm",
+    };
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
     self.renderer_state.mutex.lockUncancelable(global.io());
@@ -5306,11 +5346,14 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             v,
         ),
 
-        .new_tab => return try self.rt_app.performAction(
-            .{ .surface = self },
-            .new_tab,
-            {},
-        ),
+        .new_tab => {
+            self.htmNotePending(.tab);
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .new_tab,
+                {},
+            );
+        },
 
         .close_tab => |v| return try self.rt_app.performAction(
             .{ .surface = self },
@@ -5350,10 +5393,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
-        .new_split => |direction| return try self.rt_app.performAction(
-            .{ .surface = self },
-            .new_split,
-            switch (direction) {
+        .new_split => |direction| {
+            const resolved: apprt.action.SplitDirection = switch (direction) {
                 .right => .right,
                 .left => .left,
                 .down => .down,
@@ -5362,8 +5403,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                     .right
                 else
                     .down,
-            },
-        ),
+            };
+            self.htmNotePending(switch (resolved) {
+                .left, .right => .split_vertical,
+                .up, .down => .split_horizontal,
+            });
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .new_split,
+                resolved,
+            );
+        },
 
         .goto_split => |direction| return try self.rt_app.performAction(
             .{ .surface = self },
@@ -6535,6 +6585,142 @@ fn presentSurface(self: *Surface) !void {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Surface, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.io.getProcessInfo(info);
+}
+
+fn htmNotePending(self: *Surface, pending: HtmSession.Pending) void {
+    if (self.app.htm) |*session| {
+        if (session.isLeader(self) or session.isFollower(self)) {
+            session.pending = pending;
+            session.pending_source = self;
+        }
+    }
+}
+
+fn htmNotifyCreated(
+    self: *Surface,
+    session: *HtmSession.Session,
+    pending: HtmSession.Pending,
+    pending_source: ?*Surface,
+) void {
+    const pane_id = self.htm_pane_id orelse return;
+    switch (pending) {
+        .none => {},
+        .tab => {
+            const tab_id = terminal.htm.generateUuid();
+            const packet = terminal.htm.encodeNewTab(self.alloc, tab_id, pane_id) catch |err| {
+                log.warn("failed to encode HTM NEW_TAB err={}", .{err});
+                return;
+            };
+            defer self.alloc.free(packet);
+            session.writeToLeader(packet);
+        },
+        .split_vertical, .split_horizontal => {
+            const parent = pending_source orelse self.app.focusedSurface() orelse session.leader;
+            const source_id = session.paneForSurface(parent) orelse {
+                log.warn("HTM split has no source pane", .{});
+                return;
+            };
+            const packet = terminal.htm.encodeNewSplit(
+                self.alloc,
+                source_id,
+                pane_id,
+                pending == .split_vertical,
+            ) catch |err| {
+                log.warn("failed to encode HTM NEW_SPLIT err={}", .{err});
+                return;
+            };
+            defer self.alloc.free(packet);
+            session.writeToLeader(packet);
+        },
+    }
+}
+
+fn htmOnDeinit(self: *Surface) void {
+    if (self.app.htm) |*session| {
+        if (session.isLeader(self)) {
+            var owned = session.*;
+            self.app.htm = null;
+            owned.closeFollowers();
+            owned.deinit();
+            return;
+        }
+        if (self.htm_pane_id) |id| {
+            if (!session.waiting_for_init) {
+                const packet = terminal.htm.encodeClientClosePane(self.alloc, id) catch |err| blk: {
+                    log.warn("failed to encode HTM CLIENT_CLOSE_PANE err={}", .{err});
+                    break :blk null;
+                };
+                if (packet) |p| {
+                    defer self.alloc.free(p);
+                    session.writeToLeader(p);
+                }
+            }
+            session.unregisterSurface(self);
+        }
+    }
+}
+
+fn htmEnter(self: *Surface) void {
+    if (self.app.htm != null) {
+        log.warn("HTM session already active, ignoring enter", .{});
+        return;
+    }
+    self.app.htm = .init(self.alloc, self);
+    log.info("HTM mode entered leader={x}", .{self.id});
+}
+
+fn htmSyncLayout(self: *Surface, req: apprt.surface.Message.WriteReq) void {
+    defer req.deinit();
+    const session = if (self.app.htm) |*s| s else {
+        log.warn("HTM INIT_STATE without session", .{});
+        return;
+    };
+    var init_state = terminal.htm.parseInitState(self.alloc, req.slice()) catch |err| {
+        log.warn("failed to parse HTM INIT_STATE err={}", .{err});
+        self.htmNotifyInitComplete();
+        return;
+    };
+    defer init_state.deinit();
+    session.applyLayout(&init_state);
+    self.htmNotifyInitComplete();
+}
+
+fn htmNotifyInitComplete(self: *Surface) void {
+    self.io.queueMessage(.{ .htm_init_complete = {} }, .unlocked);
+}
+
+fn htmHandleOutput(self: *Surface, req: apprt.surface.Message.WriteReq) void {
+    defer req.deinit();
+    const slice = req.slice();
+    if (slice.len < terminal.htm.UUID_LENGTH) return;
+    var pane_id: terminal.htm.Uuid = undefined;
+    @memcpy(&pane_id, slice[0..terminal.htm.UUID_LENGTH]);
+    const data = slice[terminal.htm.UUID_LENGTH..];
+    const dest = dest: {
+        const session = if (self.app.htm) |*s| s else break :dest null;
+        break :dest session.surfaceForPane(pane_id);
+    };
+    if (dest) |surface| {
+        surface.io.processOutput(data);
+    }
+}
+
+fn htmClosePane(self: *Surface, pane_id: terminal.htm.Uuid) void {
+    const session = if (self.app.htm) |*s| s else return;
+    const surface = session.surfaceForPane(pane_id) orelse return;
+    session.unregisterSurface(surface);
+    surface.close();
+}
+
+fn htmExit(self: *Surface) void {
+    if (self.app.htm) |*session| {
+        if (!session.isLeader(self)) return;
+        var owned = session.*;
+        self.app.htm = null;
+        owned.closeFollowers();
+        owned.deinit();
+        log.info("HTM mode exited", .{});
+    }
 }
 
 test "queueIo frees allocated writes in readonly mode" {

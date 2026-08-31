@@ -153,6 +153,21 @@ pub const Message = union(enum) {
     /// Selected search index change
     search_selected: ?usize,
 
+    /// This surface detected HTM init and should become the session leader.
+    htm_enter: void,
+
+    /// HTM INIT_STATE JSON. Receiver owns the WriteReq memory.
+    htm_sync_layout: WriteReq,
+
+    /// Decoded pane output to inject into this surface's terminal.
+    htm_output: WriteReq,
+
+    /// `htmd` closed this pane.
+    htm_close_pane: terminal.htm.Uuid,
+
+    /// Leave HTM mode and close follower surfaces.
+    htm_exit: void,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 

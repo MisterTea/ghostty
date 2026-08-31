@@ -16,6 +16,7 @@ const BlockingQueue = @import("datastruct/main.zig").BlockingQueue;
 const renderer = @import("renderer.zig");
 const font = @import("font/main.zig");
 const global = @import("global.zig");
+const HtmSession = @import("HtmSession.zig");
 
 const log = std.log.scoped(.app);
 
@@ -65,8 +66,12 @@ last_notification_digest: u64 = 0,
 /// to the app-level config and as a default for new surfaces.
 config_conditional_state: configpkg.ConditionalState,
 
+/// Active HTM session, if any. HTM allows one IPC client so we keep a
+/// single session for the app.
+htm: ?HtmSession.Session = null,
+
 /// Set to false once we've created at least one surface. This
-/// never goes true again. This can be used by surfaces to determine
+/// never goes true again. This is used by surfaces to determine
 /// if they are the first surface.
 first: bool = true,
 
@@ -126,10 +131,16 @@ pub fn init(
         .mailbox = .{},
         .font_grid_set = font_grid_set,
         .config_conditional_state = .{},
+        .htm = null,
     };
 }
 
 pub fn deinit(self: *App) void {
+    if (self.htm) |*session| {
+        session.deinit();
+        self.htm = null;
+    }
+
     // Clean up all our surfaces
     for (self.surfaces.items) |surface| surface.deinit();
     self.surfaces.deinit(self.alloc);
